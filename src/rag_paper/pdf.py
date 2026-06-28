@@ -5,6 +5,7 @@ from pathlib import Path
 import fitz
 
 from rag_paper.models import PaperDocument
+from rag_paper.title_quality import best_title, is_trusted_title
 
 
 def extract_pdf_text(path: Path, extra_metadata: dict[str, object] | None = None) -> PaperDocument:
@@ -18,8 +19,9 @@ def extract_pdf_text(path: Path, extra_metadata: dict[str, object] | None = None
     pages: list[str] = []
     with fitz.open(path) as doc:
         if doc.metadata:
-            if doc.metadata.get("title") and not metadata.get("title"):
-                metadata["title"] = doc.metadata["title"]
+            pdf_title = doc.metadata.get("title")
+            if pdf_title and not metadata.get("title") and is_trusted_title(pdf_title):
+                metadata["title"] = pdf_title
             if doc.metadata.get("author") and not metadata.get("authors"):
                 metadata["authors"] = [doc.metadata["author"]]
         metadata["page_count"] = doc.page_count
@@ -28,5 +30,22 @@ def extract_pdf_text(path: Path, extra_metadata: dict[str, object] | None = None
             if text.strip():
                 pages.append(f"\n\n[Page {page_number}]\n{text}")
 
-    return PaperDocument(path=path, text="".join(pages).strip(), metadata=metadata)
+    text = "".join(pages).strip()
+    if not is_trusted_title(metadata.get("title")):
+        metadata.pop("title", None)
+        inferred_title = best_title(_title_from_first_page(text), file_name=path.name)
+        if inferred_title:
+            metadata["title"] = inferred_title
 
+    return PaperDocument(path=path, text=text, metadata=metadata)
+
+
+def _title_from_first_page(text: str) -> str:
+    lines = [
+        line.strip()
+        for line in text.splitlines()[:80]
+        if 8 <= len(line.strip()) <= 220 and not line.strip().startswith("[Page ")
+    ]
+    if not lines:
+        return ""
+    return max(lines[:8], key=len)

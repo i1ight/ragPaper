@@ -70,11 +70,67 @@ rag-paper list-indexed-papers
 rag-paper show-indexed-paper "attention" --limit 3
 ```
 
+删除错误的已索引记录：
+
+```bash
+rag-paper delete-indexed-paper "10.55277/researchhub.x9vnpm0y.1"
+rag-paper build-citation-graph
+```
+
 启动 MCP：
 
 ```bash
 rag-paper serve
 ```
+
+## 技术栈
+
+- **PyMuPDF**：PDF 文本抽取和 PDF 内置 metadata 读取。
+- **ChromaDB**：本地持久化向量数据库，用于保存论文 chunk。
+- **Rank BM25**：关键词检索路径，用于混合检索。
+- **MCP Python SDK**：向 Codex CLI、Claude Code 等 MCP 客户端暴露检索工具。
+
+## 模块功能
+
+### 索引模块
+
+`rag-paper index` 会扫描配置中的 PDF 根目录，遵守 `skip_marker_file`，抽取 PDF 文本，切分 chunk，生成 embedding，并写入 Chroma。开始向量化前会展示待处理文件数量和对应根路径，除非使用 `--yes` 或启用 `indexing.assume_yes`。
+
+索引是增量式的。rag-paper 会在 manifest 中记录 `size + mtime_ns`，只有快速文件签名变化时才计算 SHA256。索引失败的文件会写入 JSONL 失败记录，可用 `rag-paper index --retry-failed` 重试。
+
+### 检索模块
+
+`rag-paper search` 在本地已索引 chunk 上执行混合检索。它结合 Chroma 向量相似度和 BM25 关键词匹配，返回适合交给 LLM 的精简上下文，避免把整篇 PDF 都发送给模型。
+
+检索支持作者、年份、标签和文件名过滤。MCP Server 内部也复用同一套检索能力。
+
+### 已索引论文查看与删除
+
+`rag-paper list-indexed-papers` 以表格展示 Chroma 中已有论文，包括总论文数、chunk 数、标题、DOI、年份和来源路径。
+
+`rag-paper show-indexed-paper` 支持对标题、文件名、来源路径和 DOI 进行模糊查询。默认只展示前 5 个 Chunk IDs，可用 `--all-chunks` 展示全部。
+
+`rag-paper delete-indexed-paper` 会从 Chroma 和 index manifest 中删除匹配论文。未使用 `--yes` 时，无论匹配数量多少，都需要逐篇确认后才删除。删除后建议运行 `rag-paper build-citation-graph` 刷新引用图。
+
+### DOI 和元数据补全模块
+
+`rag-paper enrich-metadata` 会为已索引论文补全 DOI 和文献信息。它支持 CrossRef、OpenAlex、接口 fallback、访问速率控制、自定义 User-Agent、联系邮箱，以及 HTTP/HTTPS/SOCKS5 代理。
+
+补全模块与向量化模块解耦。它可以在每篇论文向量化后执行、全部索引结束后执行，也可以手动执行。补全结果写入 `paper_metadata.json`，接口返回结果会缓存到 SQLite。
+
+title 质量校验会拒绝明显广告、URL、特殊符号密度过高、疑似垃圾 PDF metadata title。PDF 内置 title 不可信时，会优先使用首页推断标题、DOI provider 标题或文件名。
+
+### 去重模块
+
+`rag-paper dedupe-papers` 用于索引前生成重复论文报告。它可以基于 DOI、title-year metadata 判断，也可以使用摘要或正文片段构建语义签名进行近似去重。根据配置，重复论文可以仅报告，也可以跳过。
+
+### Citation Graph 模块
+
+`rag-paper build-citation-graph` 会基于补全后的 DOI/OpenAlex 元数据构建引用图，并导出 JSON 和 Mermaid Markdown。Mermaid 输出适合直接放入 Obsidian 查看论文引用关系。
+
+### MCP Server 模块
+
+`rag-paper serve` 会启动 MCP Server，让外部工具查询本地论文库。MCP 客户端可以导入论文、检索 chunk、查看已索引论文、查看 metadata、删除错误索引、补全 metadata、去重、获取特定 chunk、导出上下文和构建 citation graph。
 
 ## Zotero 与 root_path
 
@@ -105,7 +161,6 @@ rag-paper 会递归扫描这些路径，只导入 `.pdf` 文件。
 
 - 未公开论文
 - 私人笔记
-- 保密资料
 - 不希望通过 MCP 暴露的 PDF
 
 示例：
@@ -236,6 +291,7 @@ rag-paper index --retry-failed
 rag-paper enrich-metadata
 rag-paper list-indexed-papers
 rag-paper show-indexed-paper "selector"
+rag-paper delete-indexed-paper "selector"
 rag-paper search "query"
 rag-paper dedupe-papers
 rag-paper build-citation-graph

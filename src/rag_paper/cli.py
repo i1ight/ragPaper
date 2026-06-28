@@ -17,6 +17,8 @@ from rag_paper.enrichment import discover_enrichment_targets, enrich_targets
 from rag_paper.indexer import IndexPlan, SkipMarkerHit, run_indexing
 from rag_paper.inspection import (
     IndexedPaperDetail,
+    delete_indexed_paper_details,
+    delete_indexed_papers,
     inspect_indexed_paper,
     inspect_indexed_papers,
     is_pdf_indexed,
@@ -153,6 +155,47 @@ def show_indexed_paper(
         raise click.ClickException(f"Indexed paper not found: {selector}")
     for detail in details:
         _print_indexed_paper_detail(detail, config, show_all_chunks=all_chunks)
+
+
+@cli.command("delete-indexed-paper")
+@click.argument("selector")
+@click.option("--config", "config_path", default="./config.json", show_default=True)
+@click.option("--limit", default=10, show_default=True, type=click.IntRange(min=1), help="Maximum matching papers to delete.")
+@click.option("--yes", is_flag=True, help="Delete without interactive confirmation.")
+def delete_indexed_paper_command(
+    selector: str,
+    config_path: str,
+    limit: int,
+    yes: bool,
+) -> None:
+    """Delete matching indexed papers from local Chroma."""
+    config = load_app_config(config_path)
+    details = inspect_indexed_paper(config, selector, limit=limit)
+    if not details:
+        raise click.ClickException(f"Indexed paper not found: {selector}")
+
+    _print_delete_plan(details)
+    confirmed_details = details
+    if not yes and not config.indexing.assume_yes:
+        confirmed_details = _confirm_each_delete(details)
+    if not confirmed_details:
+        console.print("No indexed papers selected for deletion.")
+        return
+
+    summary = delete_indexed_paper_details(config, confirmed_details)
+    table = Table(title="Delete Indexed Papers Summary")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Deleted papers", str(summary.deleted_papers))
+    table.add_row("Deleted chunks", str(summary.deleted_chunks))
+    table.add_row("Chroma dir", str(config.chroma_dir))
+    table.add_row("Collection", config.chroma.collection)
+    console.print(table)
+    if summary.deleted_papers:
+        console.print(
+            "[bold yellow]Citation graph may now be stale. "
+            "Run `rag-paper build-citation-graph` to refresh it.[/bold yellow]"
+        )
 
 
 @cli.command("dedupe-papers")
@@ -344,6 +387,38 @@ def _print_indexed_paper_detail(
         chunks.add_section()
         chunks.add_row("", f"{hidden_count} more hidden; rerun with --all-chunks to show all.")
     console.print(chunks)
+
+
+def _print_delete_plan(details: list[IndexedPaperDetail]) -> None:
+    table = Table(title="Delete Indexed Papers Plan")
+    table.add_column("#", justify="right", no_wrap=True, width=4)
+    table.add_column("Title / File", overflow="fold", ratio=4)
+    table.add_column("Chunks", justify="right", no_wrap=True, width=7)
+    table.add_column("DOI", overflow="fold", ratio=2)
+    table.add_column("Source", overflow="fold", ratio=3)
+    for index, detail in enumerate(details, start=1):
+        table.add_row(
+            str(index),
+            detail.title or detail.file_name,
+            str(detail.chunk_count),
+            detail.doi,
+            detail.source_path,
+        )
+    console.print(table)
+
+
+def _confirm_each_delete(details: list[IndexedPaperDetail]) -> list[IndexedPaperDetail]:
+    confirmed: list[IndexedPaperDetail] = []
+    for detail in details:
+        title = detail.title or detail.file_name
+        console.print(f"\n[bold yellow]Candidate:[/bold yellow] {title}")
+        console.print(f"Source: {detail.source_path}")
+        if detail.doi:
+            console.print(f"DOI: {detail.doi}")
+        console.print(f"Chunks: {detail.chunk_count}")
+        if click.confirm("Delete this indexed paper from Chroma?", default=False):
+            confirmed.append(detail)
+    return confirmed
 
 
 def _format_metadata_value(key: str, value: Any, config: AppConfig) -> str:

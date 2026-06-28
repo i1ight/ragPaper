@@ -21,6 +21,7 @@ from rag_paper.metadata import (
     save_paper_metadata,
 )
 from rag_paper.pdf import extract_pdf_text
+from rag_paper.title_quality import best_title, is_trusted_title
 
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 TRAILING_DOI_CHARS = ".,;:)]}>\"'"
@@ -330,7 +331,7 @@ def extract_doi(value: str) -> str | None:
 
 def infer_title(metadata: dict[str, Any], text: str) -> str:
     title = metadata.get("title")
-    if isinstance(title, str) and title.strip():
+    if is_trusted_title(title):
         return title.strip()
 
     lines = [
@@ -339,8 +340,8 @@ def infer_title(metadata: dict[str, Any], text: str) -> str:
         if 8 <= len(line.strip()) <= 220 and not line.strip().startswith("[Page ")
     ]
     if not lines:
-        return ""
-    return max(lines[:8], key=len)
+        return best_title(file_name=str(metadata.get("file_name") or ""))
+    return best_title(max(lines[:8], key=len), file_name=str(metadata.get("file_name") or ""))
 
 
 def discover_enrichment_targets(
@@ -491,8 +492,14 @@ def _merge_work_metadata(
     force: bool,
 ) -> dict[str, Any]:
     enriched = dict(metadata)
+    if "title" in enriched and not is_trusted_title(enriched.get("title")):
+        enriched.pop("title", None)
     _set_metadata(enriched, "doi", work.doi, force=force)
-    _set_metadata(enriched, "title", work.title, force=force)
+    _set_title_metadata(enriched, work.title, force=force)
+    if not is_trusted_title(enriched.get("title")) and metadata.get("file_name"):
+        fallback_title = best_title(file_name=str(metadata.get("file_name")))
+        if fallback_title:
+            enriched["title"] = fallback_title
     _set_metadata(enriched, "authors", work.authors, force=force)
     _set_metadata(enriched, "year", work.year, force=force)
     _set_metadata(enriched, "container_title", work.container_title, force=force)
@@ -514,6 +521,12 @@ def _set_metadata(metadata: dict[str, Any], key: str, value: Any, *, force: bool
         return
     if force or not metadata.get(key):
         metadata[key] = value
+
+
+def _set_title_metadata(metadata: dict[str, Any], value: Any, *, force: bool) -> None:
+    if not is_trusted_title(value):
+        return
+    _set_metadata(metadata, "title", value, force=force)
 
 
 def _work_from_crossref_message(message: dict[str, Any]) -> CrossRefWork | None:

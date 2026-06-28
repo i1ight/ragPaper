@@ -9,7 +9,7 @@ from rag_paper.config import AppConfig
 from rag_paper.dedup import run_dedup_report
 from rag_paper.enrichment import enrich_metadata
 from rag_paper.indexer import run_indexing
-from rag_paper.inspection import inspect_indexed_paper, inspect_indexed_papers
+from rag_paper.inspection import delete_indexed_papers, inspect_indexed_paper, inspect_indexed_papers
 from rag_paper.logging import configure_logging, logger
 from rag_paper.retrieval import HybridRetriever, result_to_dict
 
@@ -103,6 +103,19 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
             item["hidden_chunk_ids"] = 0 if include_all_chunks else max(0, len(chunk_ids) - 5)
             payload.append(item)
         return payload
+
+    @mcp.tool()
+    def delete_indexed_paper(selector: str, limit: int = 10) -> dict[str, Any]:
+        """Delete matching indexed papers from local Chroma and the index manifest."""
+        summary = delete_indexed_papers(config, selector, limit=limit)
+        logger.info("mcp.delete_indexed_paper", **summary.__dict__)
+        return {
+            "matched_papers": summary.matched_papers,
+            "deleted_papers": summary.deleted_papers,
+            "deleted_chunks": summary.deleted_chunks,
+            "papers": [paper.__dict__ for paper in summary.papers],
+            "next_step": "Run build_paper_citation_graph to refresh citation graph exports.",
+        }
 
     @mcp.tool()
     def import_papers(

@@ -81,11 +81,67 @@ rag-paper list-indexed-papers
 rag-paper show-indexed-paper "attention" --limit 3
 ```
 
+Delete a bad indexed record:
+
+```bash
+rag-paper delete-indexed-paper "10.55277/researchhub.x9vnpm0y.1"
+rag-paper build-citation-graph
+```
+
 Start the MCP server:
 
 ```bash
 rag-paper serve
 ```
+
+## Tech Stack
+
+- **PyMuPDF**: PDF text extraction and PDF metadata reading.
+- **ChromaDB**: local persistent vector database for paper chunks.
+- **Rank BM25**: keyword retrieval path for hybrid search.
+- **MCP Python SDK**: exposes paper search and inspection tools to Codex CLI, Claude Code, and other MCP clients.
+
+## Modules
+
+### Indexing
+
+`rag-paper index` scans configured PDF roots, respects `skip_marker_file`, extracts text, chunks papers, creates embeddings, and writes chunks to Chroma. Before vectorization it shows the number of files and the root paths they came from unless `--yes` or `indexing.assume_yes` is enabled.
+
+Indexing is incremental. rag-paper stores `size + mtime_ns` in the manifest and only computes SHA256 when the quick file signature changes. Failed files are recorded in a JSONL log and can be retried with `rag-paper index --retry-failed`.
+
+### Search and Retrieval
+
+`rag-paper search` performs local hybrid retrieval over indexed chunks. It combines vector similarity from Chroma with BM25 keyword matching, then returns compact source-aware excerpts that are suitable for sending to an LLM instead of whole PDFs.
+
+Search supports filters such as author, year, tag, and file name. The same retrieval engine powers the MCP tools.
+
+### Indexed Paper Inspection
+
+`rag-paper list-indexed-papers` shows the current Chroma library as a terminal table, including total paper count, chunk count, title, DOI, year, and source path.
+
+`rag-paper show-indexed-paper` supports fuzzy selectors over title, file name, source path, and DOI. It shows merged metadata and the first 5 chunk IDs by default; use `--all-chunks` to show every chunk ID.
+
+`rag-paper delete-indexed-paper` deletes matching papers from Chroma and the index manifest. Without `--yes`, every matched paper must be confirmed one by one before deletion. After deleting indexed papers, run `rag-paper build-citation-graph` to refresh citation graph exports.
+
+### Metadata Enrichment
+
+`rag-paper enrich-metadata` enriches indexed papers with DOI and bibliographic metadata. It supports CrossRef and OpenAlex, provider fallback, rate limiting, custom User-Agent, contact email, and HTTP/HTTPS/SOCKS5 proxies.
+
+The enrichment module is decoupled from vectorization. It can run per indexed file, after indexing finishes, or manually. Results are written to `paper_metadata.json` and provider responses are cached in SQLite.
+
+Title quality checks reject obvious spam, URLs, ad-like strings, and symbol-heavy PDF metadata titles. When a PDF title is not trusted, rag-paper prefers a title inferred from the first page, a provider title, or the file name.
+
+### Deduplication
+
+`rag-paper dedupe-papers` reports duplicate candidates before indexing. It can compare DOI/title-year metadata and optional semantic signatures built from paper text or abstracts. Depending on configuration, duplicates can be reported or skipped.
+
+### Citation Graph
+
+`rag-paper build-citation-graph` builds a graph from enriched DOI/OpenAlex metadata and exports JSON plus Mermaid Markdown. The Mermaid output is designed to work well in Obsidian for browsing paper relationships.
+
+### MCP Server
+
+`rag-paper serve` starts an MCP server so external tools can query the local paper library. MCP clients can import papers, search chunks, list indexed papers, inspect metadata, delete indexed records, enrich metadata, deduplicate papers, fetch specific chunks, export context, and build citation graphs.
 
 ## Typical Workflows
 
@@ -254,6 +310,7 @@ Available MCP tools include:
 - `import_papers`
 - `list_indexed_papers`
 - `show_indexed_paper`
+- `delete_indexed_paper`
 - `search_papers`
 - `search_by_metadata`
 - `get_chunk`
@@ -274,6 +331,7 @@ rag-paper index --retry-failed
 rag-paper enrich-metadata
 rag-paper list-indexed-papers
 rag-paper show-indexed-paper "selector"
+rag-paper delete-indexed-paper "selector"
 rag-paper search "query"
 rag-paper dedupe-papers
 rag-paper build-citation-graph

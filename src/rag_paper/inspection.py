@@ -9,6 +9,8 @@ import chromadb
 from chromadb.api.models.Collection import Collection
 
 from rag_paper.config import AppConfig
+from rag_paper.manifest import IndexManifest
+from rag_paper.title_quality import best_title
 
 
 @dataclass
@@ -33,6 +35,14 @@ class IndexedLibrarySummary:
     paper_count: int
     chunk_count: int
     shown_count: int
+    papers: list[IndexedPaperSummary]
+
+
+@dataclass(frozen=True)
+class DeleteIndexedPapersSummary:
+    matched_papers: int
+    deleted_papers: int
+    deleted_chunks: int
     papers: list[IndexedPaperSummary]
 
 
@@ -100,6 +110,43 @@ class ChromaInspector:
         )
         return bool(payload.get("ids"))
 
+    def delete(self, selector: str, *, limit: int = 10) -> DeleteIndexedPapersSummary:
+        return self.delete_details(self.details(selector, limit=limit))
+
+    def delete_details(self, details: list[IndexedPaperDetail]) -> DeleteIndexedPapersSummary:
+        manifest = IndexManifest(self.config.chroma_dir / "index_manifest.json")
+        deleted_chunks = 0
+        deleted_papers = 0
+        papers: list[IndexedPaperSummary] = []
+
+        for detail in details:
+            if detail.chunk_ids:
+                self.collection.delete(ids=detail.chunk_ids)
+                deleted_chunks += len(detail.chunk_ids)
+            manifest.remove(Path(detail.source_path))
+            deleted_papers += 1
+            papers.append(
+                IndexedPaperSummary(
+                    source_path=detail.source_path,
+                    file_name=detail.file_name,
+                    title=detail.title,
+                    authors=detail.authors,
+                    year=detail.year,
+                    doi=detail.doi,
+                    chunk_count=detail.chunk_count,
+                )
+            )
+
+        if deleted_papers:
+            manifest.save()
+
+        return DeleteIndexedPapersSummary(
+            matched_papers=len(details),
+            deleted_papers=deleted_papers,
+            deleted_chunks=deleted_chunks,
+            papers=papers,
+        )
+
 
 def inspect_indexed_papers(config: AppConfig, *, limit: int | None = None) -> IndexedLibrarySummary:
     return ChromaInspector(config).summarize(limit=limit)
@@ -116,6 +163,22 @@ def inspect_indexed_paper(
 
 def is_pdf_indexed(config: AppConfig, pdf_path: str | Path) -> bool:
     return ChromaInspector(config).has_indexed_source(Path(pdf_path))
+
+
+def delete_indexed_papers(
+    config: AppConfig,
+    selector: str,
+    *,
+    limit: int = 10,
+) -> DeleteIndexedPapersSummary:
+    return ChromaInspector(config).delete(selector, limit=limit)
+
+
+def delete_indexed_paper_details(
+    config: AppConfig,
+    details: list[IndexedPaperDetail],
+) -> DeleteIndexedPapersSummary:
+    return ChromaInspector(config).delete_details(details)
 
 
 def _summaries_from_payload(payload: dict[str, Any]) -> list[IndexedPaperSummary]:
@@ -141,10 +204,11 @@ def _group_chunks(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 
 def _summary_from_group(source_path: str, items: list[dict[str, Any]]) -> IndexedPaperSummary:
     metadata = _merged_metadata([item["metadata"] for item in items])
+    file_name = str(metadata.get("file_name") or Path(source_path).name)
     return IndexedPaperSummary(
         source_path=source_path,
-        file_name=str(metadata.get("file_name") or Path(source_path).name),
-        title=str(metadata.get("title") or ""),
+        file_name=file_name,
+        title=best_title(metadata.get("title"), file_name=file_name),
         authors=str(metadata.get("authors") or ""),
         year=metadata.get("year"),
         doi=str(metadata.get("doi") or ""),
