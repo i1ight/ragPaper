@@ -1,0 +1,10 @@
+{
+  "example-paper.pdf": {
+    "title": "Example Paper Title",
+    "authors": ["Alice Zhang", "Bob Li"],
+    "year": 2025,
+    "tags": ["rag", "embedding"],
+    "venue": "ExampleConf"
+  }
+}
+

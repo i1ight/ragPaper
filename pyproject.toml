@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-paper"
+version = "0.1.0"
+description = "Local paper vectorization and MCP retrieval service for Codex CLI and Claude Code."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "chromadb>=0.5.0",
+    "click>=8.1.7",
+    "httpx[socks]>=0.27.0",
+    "llama-index>=0.10.60",
+    "llama-index-vector-stores-chroma>=0.1.10",
+    "mcp>=1.27,<2",
+    "pydantic>=2.7.0",
+    "pymupdf>=1.24.0",
+    "rank-bm25>=0.2.2",
+    "rich>=13.7.0",
+    "structlog>=24.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+rag-paper = "rag_paper.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rag_paper = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

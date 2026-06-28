@@ -1,0 +1,90 @@
+{
+  "data_dir": "./rag_paper_data",
+  "ollama": {
+    "base_url": "http://127.0.0.1:11434",
+    "model": "qwen3-embedding:4b",
+    "timeout_seconds": 120
+  },
+  "embedding": {
+    "provider": "ollama",
+    "dimension": 2560,
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "model": "text-embedding-3-large"
+    }
+  },
+  "papers": [
+    {
+      "root_path": ["./papers"],
+      "skip_marker_file": "",
+      "tags": []
+    }
+  ],
+  "chroma": {
+    "persist_dir": "./rag_paper_data/chroma_db",
+    "collection": "papers"
+  },
+  "indexing": {
+    "chunk_size": 1200,
+    "chunk_overlap": 180,
+    "metadata_path": "./rag_paper_data/paper_metadata.json",
+    "assume_yes": false,
+    "max_files": null,
+    "failed_path": "./rag_paper_data/logs/index_failed.jsonl"
+  },
+  "metadata_enrichment": {
+    "enabled": true,
+    "provider": "crossref",
+    "providers": ["crossref", "openalex"],
+    "timing": "per_file",
+    "base_url": "https://api.crossref.org",
+    "openalex_base_url": "https://api.openalex.org",
+    "user_agent": "rag-paper/0.1 (mailto:your-email@example.com)",
+    "mailto": "",
+    "openalex_email": "",
+    "timeout_seconds": 20,
+    "requests_per_second": 1.0,
+    "http_proxy": "",
+    "https_proxy": "",
+    "socks5_proxy": "",
+    "min_title_score": 0.0,
+    "max_query_chars": 300,
+    "cache_path": "./rag_paper_data/cache/metadata_enrichment.sqlite3"
+  },
+  "dedup": {
+    "enabled": false,
+    "semantic_enabled": true,
+    "action": "report",
+    "report_path": "./rag_paper_data/logs/duplicate_papers.json",
+    "similarity_threshold": 0.92,
+    "signature_chars": 3000,
+    "max_files": null
+  },
+  "citation_graph": {
+    "path": "./rag_paper_data/citation_graph/citation_graph.json",
+    "mermaid_path": "./rag_paper_data/citation_graph/citation_graph.md",
+    "include_external_nodes": true
+  },
+  "display": {
+    "datetime_timezone": "local",
+    "datetime_format": ""
+  },
+  "retrieval": {
+    "vector_top_k": 12,
+    "bm25_top_k": 12,
+    "default_top_k": 8,
+    "vector_weight": 0.65,
+    "bm25_weight": 0.35
+  },
+  "mcp": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "transport": "streamable-http"
+  },
+  "logging": {
+    "level": "INFO",
+    "json": true,
+    "stats_path": "./rag_paper_data/logs/retrieval_stats.jsonl"
+  }
+}

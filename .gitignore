@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+config.json
+paper_metadata.json
+papers/
+chroma_db/
+rag_paper_data/
+logs/
+
+.pytest_cache/
+.ruff_cache/
