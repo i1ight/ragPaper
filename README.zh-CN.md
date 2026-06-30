@@ -85,10 +85,18 @@ rag-paper serve
 
 ## 技术栈
 
+- **Python 3.10+**：类型化 CLI 应用和本地服务运行时。
+- **Click + Rich**：跨平台命令行、确认提示和终端表格展示。
 - **PyMuPDF**：PDF 文本抽取和 PDF 内置 metadata 读取。
 - **ChromaDB**：本地持久化向量数据库，用于保存论文 chunk。
+- **Ollama Embeddings**：默认本地向量模型，使用 `qwen3-embedding:4b`。
+- **OpenAI-compatible Embeddings**：可选远程 embedding 后端。
 - **Rank BM25**：关键词检索路径，用于混合检索。
+- **httpx**：访问 CrossRef/OpenAlex，支持 HTTP、HTTPS、SOCKS5 代理。
+- **SQLite**：metadata enrichment 缓存，减少重复请求。
 - **MCP Python SDK**：向 Codex CLI、Claude Code 等 MCP 客户端暴露检索工具。
+- **Pydantic**：配置校验和旧配置结构迁移。
+- **structlog**：索引、补全、检索和失败记录的结构化日志。
 
 ## 模块功能
 
@@ -254,6 +262,11 @@ rag-paper enrich-metadata --file /path/to/paper.pdf --force
 
 ## MCP 配置示例
 
+rag-paper 支持以下 MCP 传输方式：
+
+- `streamable-http`：默认由 `config.json` 里的 `mcp.transport` 启用，适合长期运行的 HTTP MCP 客户端。
+- `stdio`：支持 `agent-infra/mcp-hub` 这类由客户端托管进程的 MCP 客户端；启动时传入 `--transport stdio`，stdout 会保留给 MCP 协议消息。
+
 Streamable HTTP：
 
 ```json
@@ -273,7 +286,7 @@ stdio：
   "mcpServers": {
     "rag-paper": {
       "command": "rag-paper",
-      "args": ["serve"]
+      "args": ["serve", "--transport", "stdio"]
     }
   }
 }

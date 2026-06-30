@@ -94,12 +94,23 @@ Start the MCP server:
 rag-paper serve
 ```
 
+By default this starts the MCP service with `streamable-http` on `http://127.0.0.1:8765/mcp`.
+For stdio clients, start it with `rag-paper serve --transport stdio`.
+
 ## Tech Stack
 
+- **Python 3.10+**: typed CLI application and local service runtime.
+- **Click + Rich**: cross-platform command-line interface, confirmation prompts, and terminal tables.
 - **PyMuPDF**: PDF text extraction and PDF metadata reading.
 - **ChromaDB**: local persistent vector database for paper chunks.
+- **Ollama embeddings**: default local embedding provider using `qwen3-embedding:4b`.
+- **OpenAI-compatible embeddings**: optional remote embedding backend.
 - **Rank BM25**: keyword retrieval path for hybrid search.
+- **httpx**: CrossRef/OpenAlex metadata requests with HTTP, HTTPS, and SOCKS5 proxy support.
+- **SQLite**: metadata enrichment cache to reduce repeated provider requests.
 - **MCP Python SDK**: exposes paper search and inspection tools to Codex CLI, Claude Code, and other MCP clients.
+- **Pydantic**: configuration validation and migration for older config shapes.
+- **structlog**: structured logs for indexing, enrichment, search, and failures.
 
 ## Modules
 
@@ -279,6 +290,11 @@ Start the MCP server:
 rag-paper serve
 ```
 
+rag-paper supports both MCP transports below:
+
+- `streamable-http`: enabled by default through `mcp.transport` in `config.json`; use this for long-running HTTP MCP clients.
+- `stdio`: supported for process-managed MCP clients such as `agent-infra/mcp-hub`; pass `--transport stdio` so startup status is written to stderr and stdout remains reserved for MCP protocol messages.
+
 Streamable HTTP configuration example:
 
 ```json
@@ -298,7 +314,7 @@ stdio configuration example:
   "mcpServers": {
     "rag-paper": {
       "command": "rag-paper",
-      "args": ["serve"]
+      "args": ["serve", "--transport", "stdio"]
     }
   }
 }

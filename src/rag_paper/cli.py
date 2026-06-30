@@ -3,7 +3,7 @@ from __future__ import annotations
 import locale
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import click
@@ -29,6 +29,7 @@ from rag_paper.mcp_server import run_mcp_server
 from rag_paper.retrieval import HybridRetriever, result_to_dict
 
 console = Console()
+McpTransport = Literal["stdio", "sse", "streamable-http"]
 
 
 def load_app_config(config_path: str) -> AppConfig:
@@ -285,9 +286,19 @@ def enrich_metadata_command(
 
 @cli.command("serve")
 @click.option("--config", "config_path", default="./config.json", show_default=True)
-def serve(config_path: str) -> None:
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "sse", "streamable-http"]),
+    default=None,
+    help="Override mcp.transport for this run.",
+)
+def serve(config_path: str, transport: str | None) -> None:
     """Start the MCP knowledge retrieval service."""
     config = load_app_config(config_path)
+    if transport is not None:
+        config.mcp.transport = cast(McpTransport, transport)
+
+    service_console = Console(stderr=config.mcp.transport == "stdio")
     table = Table(title="MCP Service")
     table.add_column("Item")
     table.add_column("Value")
@@ -302,7 +313,7 @@ def serve(config_path: str) -> None:
         table.add_row("Paper root", str(paper_dir))
     table.add_row("Chroma dir", str(config.chroma_dir))
     table.add_row("Collection", config.chroma.collection)
-    console.print(table)
+    service_console.print(table)
     run_mcp_server(config)
 
 

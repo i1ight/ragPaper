@@ -1,8 +1,16 @@
-.venv/
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.venv/
+venv/
+build/
+dist/
 
+# Local configuration and data
+.env
+.env.*
+!.env.example
 config.json
 paper_metadata.json
 papers/
@@ -10,5 +18,19 @@ chroma_db/
 rag_paper_data/
 logs/
 
+# Test and tooling caches
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local workspace metadata
+.agents/
+.codex/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
