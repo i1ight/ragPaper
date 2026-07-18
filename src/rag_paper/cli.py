@@ -14,7 +14,7 @@ from rag_paper.citation_graph import build_citation_graph
 from rag_paper.config import AppConfig, load_config, write_default_config
 from rag_paper.dedup import run_dedup_report
 from rag_paper.enrichment import discover_enrichment_targets, enrich_targets
-from rag_paper.indexer import IndexPlan, SkipMarkerHit, run_indexing
+from rag_paper.indexer import IndexPlan, SkipMarkerHit, refresh_chunk_metadata, run_indexing
 from rag_paper.inspection import (
     IndexedPaperDetail,
     delete_indexed_paper_details,
@@ -62,6 +62,11 @@ def init_config(path: str) -> None:
 @click.option("--file", "file_path", help="Index or refresh one PDF file.")
 @click.option("--only-new", is_flag=True, help="Only index PDFs not present in the manifest.")
 @click.option("--retry-failed", is_flag=True, help="Retry PDFs recorded in the index failure log.")
+@click.option(
+    "--update-metadata-only",
+    is_flag=True,
+    help="Refresh chunk metadata from paper_metadata.json without re-vectorizing (run after enrich-metadata).",
+)
 @click.option("--yes", is_flag=True, help="Start vectorization without interactive confirmation.")
 @click.option("--max-files", default=None, type=click.IntRange(min=0), help="Maximum PDFs to vectorize.")
 def index(
@@ -70,11 +75,22 @@ def index(
     file_path: str | None,
     only_new: bool,
     retry_failed: bool,
+    update_metadata_only: bool,
     yes: bool,
     max_files: int | None,
 ) -> None:
     """Vectorize PDFs and store chunks in Chroma."""
     config = load_app_config(config_path)
+    if update_metadata_only:
+        summary = refresh_chunk_metadata(config)
+        table = Table(title="Index Metadata Refresh Summary")
+        table.add_column("Metric")
+        table.add_column("Value", justify="right")
+        table.add_row("Papers updated", str(summary.papers))
+        table.add_row("Chunks updated", str(summary.chunks_updated))
+        table.add_row("Papers skipped (no metadata)", str(summary.skipped_papers))
+        console.print(table)
+        return
     confirm_plan = None if yes or config.indexing.assume_yes else _confirm_index_plan
     confirm_skip_markers = (
         _ack_skip_markers if yes or config.indexing.assume_yes else _confirm_skip_markers
@@ -242,12 +258,18 @@ def build_citation_graph_command(config_path: str) -> None:
 @cli.command("enrich-metadata")
 @click.option("--config", "config_path", default="./config.json", show_default=True)
 @click.option("--force", is_flag=True, help="Refresh metadata even when DOI already exists.")
+@click.option(
+    "--reverify",
+    is_flag=True,
+    help="Re-check DOIs already in metadata and replace any whose title no longer matches.",
+)
 @click.option("--file", "file_path", help="Enrich one PDF file.")
 @click.option("--yes", is_flag=True, help="Start enrichment without interactive confirmation.")
 @click.option("--max-files", default=None, type=click.IntRange(min=0), help="Maximum PDFs to enrich.")
 def enrich_metadata_command(
     config_path: str,
     force: bool,
+    reverify: bool,
     file_path: str | None,
     yes: bool,
     max_files: int | None,
@@ -271,6 +293,7 @@ def enrich_metadata_command(
         targets,
         metadata_map=metadata_map,
         force=force,
+        reverify=reverify,
     )
 
     table = Table(title="Metadata Enrichment Summary")
@@ -278,6 +301,7 @@ def enrich_metadata_command(
     table.add_column("Value", justify="right")
     table.add_row("Checked files", str(summary.checked_files))
     table.add_row("Updated files", str(summary.updated_files))
+    table.add_row("Cleared files", str(summary.cleared_files))
     table.add_row("Skipped files", str(summary.skipped_files))
     table.add_row("Failed files", str(summary.failed_files))
     table.add_row("Metadata path", str(config.metadata_path))

@@ -27,4 +27,9 @@ class SearchResult:
     score: float
     vector_score: float | None = None
     bm25_score: float | None = None
+    # Populated only when results are grouped by paper (group_by_paper):
+    chunk_count: int | None = None
+    other_chunk_ids: list[str] | None = None
+    # Populated only when a reranker re-scored this candidate:
+    rerank_score: float | None = None
 

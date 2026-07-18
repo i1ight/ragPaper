@@ -181,6 +181,154 @@ def delete_indexed_paper_details(
     return ChromaInspector(config).delete_details(details)
 
 
+def paper_citations(
+    config: AppConfig,
+    selector: str,
+    *,
+    external_sample: int = 20,
+    incoming_limit: int = 50,
+) -> dict[str, Any] | None:
+    """Locally-resolved citation view for one paper.
+
+    Reads every indexed paper's merged metadata, builds DOI/OpenAlex -> local
+    paper maps, and returns the target paper's outgoing references (each marked
+    whether it is in the local library) plus the local papers that reference it
+    (incoming). Read-only; does not touch the citation-graph exports.
+    """
+    inspector = ChromaInspector(config)
+    payload = inspector.collection.get(include=["metadatas"])
+    groups = _group_chunks(payload)
+    papers = {
+        source_path: _merged_metadata([item["metadata"] for item in items])
+        for source_path, items in groups.items()
+    }
+    target = _select_target(papers, selector)
+    if target is None:
+        return None
+    return _resolve_citations(
+        papers, target, external_sample=external_sample, incoming_limit=incoming_limit
+    )
+
+
+def _select_target(papers: dict[str, dict[str, Any]], selector: str) -> str | None:
+    selector = selector.strip()
+    if not selector:
+        return None
+    for source_path, metadata in papers.items():
+        file_name = str(metadata.get("file_name") or Path(source_path).name)
+        title = str(metadata.get("title") or "")
+        doi = _norm_doi(metadata.get("doi"))
+        if _matches_selector(selector, source_path, file_name, title, doi):
+            return source_path
+    return None
+
+
+def _resolve_citations(
+    papers: dict[str, dict[str, Any]],
+    target_path: str,
+    *,
+    external_sample: int,
+    incoming_limit: int,
+) -> dict[str, Any]:
+    target = papers[target_path]
+    target_doi = _norm_doi(target.get("doi"))
+    target_openalex = _cit_str(target.get("openalex_id"))
+
+    doi_to_path: dict[str, str] = {}
+    openalex_to_path: dict[str, str] = {}
+    for source_path, metadata in papers.items():
+        doi = _norm_doi(metadata.get("doi"))
+        if doi:
+            doi_to_path[doi] = source_path
+        openalex = _cit_str(metadata.get("openalex_id"))
+        if openalex:
+            openalex_to_path[openalex] = source_path
+
+    referenced_dois = {_norm_doi(item) for item in _cit_str_list(target.get("referenced_dois"))}
+    referenced_works = set(_cit_str_list(target.get("referenced_work_ids")))
+
+    outgoing_local: list[dict[str, Any]] = []
+    seen_local: set[str] = set()
+    external: list[str] = []
+
+    for doi in sorted(referenced_dois):
+        local_path = doi_to_path.get(doi)
+        if local_path and local_path != target_path and local_path not in seen_local:
+            seen_local.add(local_path)
+            outgoing_local.append(_paper_view(local_path, papers[local_path]))
+        elif not local_path:
+            external.append(f"doi:{doi}")
+    for work in sorted(referenced_works):
+        local_path = openalex_to_path.get(work)
+        if local_path and local_path != target_path and local_path not in seen_local:
+            seen_local.add(local_path)
+            outgoing_local.append(_paper_view(local_path, papers[local_path]))
+        elif not local_path:
+            external.append(work)
+
+    incoming_all: list[dict[str, Any]] = []
+    for source_path, metadata in papers.items():
+        if source_path == target_path:
+            continue
+        their_dois = {_norm_doi(item) for item in _cit_str_list(metadata.get("referenced_dois"))}
+        their_works = set(_cit_str_list(metadata.get("referenced_work_ids")))
+        if (target_doi and target_doi in their_dois) or (
+            target_openalex and target_openalex in their_works
+        ):
+            incoming_all.append(_paper_view(source_path, metadata))
+    incoming_all.sort(
+        key=lambda view: (str(view.get("year") or ""), view.get("title") or ""),
+        reverse=True,
+    )
+
+    return {
+        "paper": {
+            **_paper_view(target_path, target),
+            "openalex_id": target_openalex,
+            "cited_by_count": target.get("cited_by_count"),
+        },
+        "outgoing": {
+            "local": outgoing_local,
+            "local_count": len(outgoing_local),
+            "external_count": len(external),
+            "external_sample": external[:external_sample],
+        },
+        "incoming": incoming_all[:incoming_limit],
+        "incoming_count": len(incoming_all),
+    }
+
+
+def _paper_view(source_path: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "file_name": str(metadata.get("file_name") or Path(source_path).name),
+        "title": _cit_str(metadata.get("title")),
+        "doi": _norm_doi(metadata.get("doi")),
+        "year": metadata.get("year"),
+    }
+
+
+def _cit_str(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _cit_str_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    if isinstance(value, str) and value.strip():
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def _norm_doi(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+    return normalized
+
+
 def _summaries_from_payload(payload: dict[str, Any]) -> list[IndexedPaperSummary]:
     return [
         _summary_from_group(source_path, items)

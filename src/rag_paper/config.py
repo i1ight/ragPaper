@@ -85,7 +85,9 @@ class MetadataEnrichmentConfig(BaseModel):
     http_proxy: str = ""
     https_proxy: str = ""
     socks5_proxy: str = ""
-    min_title_score: float = Field(default=0.0, ge=0)
+    min_title_score: float = Field(default=3.0, ge=0)
+    min_openalex_score: float = Field(default=0.5, ge=0)
+    min_title_similarity: float = Field(default=0.6, ge=0, le=1)
     max_query_chars: int = Field(default=300, gt=0)
     cache_path: str = "./rag_paper_data/cache/metadata_enrichment.sqlite3"
 
@@ -139,6 +141,20 @@ class RetrievalConfig(BaseModel):
     default_top_k: int = 8
     vector_weight: float = 0.65
     bm25_weight: float = 0.35
+    fusion: Literal["rrf", "linear"] = "rrf"
+    rrf_k: int = 60
+
+
+class RerankerConfig(BaseModel):
+    enabled: bool = False
+    provider: Literal["ollama"] = "ollama"
+    base_url: str = "http://127.0.0.1:11434"
+    model: str = "dengcao/Qwen3-Reranker-4B:Q5_K_M"
+    instruction: str = "Given a web search query, retrieve relevant passages that answer the query."
+    top_k: int = Field(default=20, gt=0)  # candidates to rerank per query
+    timeout_seconds: int = 60
+    concurrency: int = Field(default=4, ge=1)
+    top_logprobs: int = Field(default=10, ge=1)  # Ollama top_logprobs for P(yes)
 
 
 class McpConfig(BaseModel):
@@ -183,6 +199,7 @@ class AppConfig(BaseModel):
     citation_graph: CitationGraphConfig = Field(default_factory=CitationGraphConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
+    reranker: RerankerConfig = Field(default_factory=RerankerConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 

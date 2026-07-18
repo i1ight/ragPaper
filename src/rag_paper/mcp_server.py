@@ -4,13 +4,9 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from rag_paper.citation_graph import build_citation_graph
 from rag_paper.config import AppConfig
-from rag_paper.dedup import run_dedup_report
-from rag_paper.enrichment import enrich_metadata
-from rag_paper.indexer import run_indexing
-from rag_paper.inspection import delete_indexed_papers, inspect_indexed_paper, inspect_indexed_papers
-from rag_paper.logging import configure_logging, logger
+from rag_paper.inspection import inspect_indexed_paper, inspect_indexed_papers, paper_citations
+from rag_paper.logging import configure_logging
 from rag_paper.retrieval import HybridRetriever, result_to_dict
 
 
@@ -21,9 +17,16 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
         host=config.mcp.host,
         port=config.mcp.port,
         instructions=(
-            "Local paper knowledge retrieval service. Use tools to import PDFs, "
-            "search indexed chunks, inspect metadata, fetch chunks, and export context. "
-            "This service is not a chat model."
+            "Local paper knowledge retrieval service (read-only). Query the indexed "
+            "paper library with these tools: search_papers for hybrid BM25 + vector "
+            "search over chunks, search_by_metadata to find chunks by author/year/tag/"
+            "file name, get_chunk to fetch one chunk by id, and export_context to export "
+            "selected chunks as a compact Markdown block. list_indexed_papers and "
+            "show_indexed_paper describe what is currently indexed. Results are "
+            "chunk-granular, so a single paper may yield several chunks; use "
+            "export_context to assemble the final context for a question. This service "
+            "does not modify the library (index/enrich/delete are CLI-only) and is not "
+            "a chat model."
         ),
     )
     retriever = HybridRetriever(config)
@@ -36,8 +39,21 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
         year: int | None = None,
         tag: str | None = None,
         file_name: str | None = None,
+        group_by_paper: bool = False,
+        max_text_chars: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Hybrid BM25 + vector search over indexed paper chunks."""
+        """Hybrid BM25 + vector search over indexed paper chunks.
+
+        Returns chunk-granular results ranked by a fused score; a single paper can
+        appear multiple times. Optional filters: author (substring), year (exact),
+        tag, file_name.
+
+        Set group_by_paper=True to collapse to the best chunk per paper (returns
+        up to top_k distinct papers, each with chunk_count and other_chunk_ids) —
+        use this for broad coverage. Set max_text_chars to truncate each chunk's
+        text for a compact first pass, then call get_chunk/export_context for full
+        text. Defaults to the configured top_k when omitted.
+        """
         results = retriever.search(
             query,
             top_k=top_k,
@@ -45,8 +61,9 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
             year=year,
             tag=tag,
             file_name=file_name,
+            group_by_paper=group_by_paper,
         )
-        return [result_to_dict(result) for result in results]
+        return [result_to_dict(result, max_text_chars=max_text_chars) for result in results]
 
     @mcp.tool()
     def search_by_metadata(
@@ -55,16 +72,25 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
         tag: str | None = None,
         file_name: str | None = None,
         limit: int = 20,
+        group_by_paper: bool = False,
+        max_text_chars: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Find chunks by paper metadata such as author, year, tag, or file name."""
+        """Find chunks by paper metadata such as author, year, tag, or file name.
+
+        Use this for structured lookups (e.g. "papers by X in 2024") without a
+        semantic query. Returns matching chunks, up to `limit`. Set
+        group_by_paper=True to get one representative chunk per paper (up to
+        `limit` distinct papers); set max_text_chars to truncate each chunk's text.
+        """
         results = retriever.search_by_metadata(
             author=author,
             year=year,
             tag=tag,
             file_name=file_name,
             limit=limit,
+            group_by_paper=group_by_paper,
         )
-        return [result_to_dict(result) for result in results]
+        return [result_to_dict(result, max_text_chars=max_text_chars) for result in results]
 
     @mcp.tool()
     def get_chunk(chunk_id: str) -> dict[str, Any] | None:
@@ -73,7 +99,11 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
 
     @mcp.tool()
     def export_context(chunk_ids: list[str]) -> str:
-        """Export selected chunks as a compact Markdown context block."""
+        """Export selected chunks as a compact Markdown context block.
+
+        Pass chunk_ids returned by search_papers/search_by_metadata to assemble the
+        final reading context for a question.
+        """
         return retriever.export_context(chunk_ids)
 
     @mcp.tool()
@@ -84,7 +114,10 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
             "paper_count": summary.paper_count,
             "chunk_count": summary.chunk_count,
             "shown_count": summary.shown_count,
-            "papers": [paper.__dict__ for paper in summary.papers],
+            "papers": [
+                {k: v for k, v in paper.__dict__.items() if k != "source_path"}
+                for paper in summary.papers
+            ],
         }
 
     @mcp.tool()
@@ -97,7 +130,10 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
         details = inspect_indexed_paper(config, selector, limit=limit)
         payload: list[dict[str, Any]] = []
         for detail in details:
-            item = detail.__dict__.copy()
+            item = {k: v for k, v in detail.__dict__.items() if k != "source_path"}
+            item["metadata"] = {
+                k: v for k, v in (detail.metadata or {}).items() if k != "source_path"
+            }
             chunk_ids = list(detail.chunk_ids)
             item["chunk_ids"] = chunk_ids if include_all_chunks else chunk_ids[:5]
             item["hidden_chunk_ids"] = 0 if include_all_chunks else max(0, len(chunk_ids) - 5)
@@ -105,92 +141,29 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
         return payload
 
     @mcp.tool()
-    def delete_indexed_paper(selector: str, limit: int = 10) -> dict[str, Any]:
-        """Delete matching indexed papers from local Chroma and the index manifest."""
-        summary = delete_indexed_papers(config, selector, limit=limit)
-        logger.info("mcp.delete_indexed_paper", **summary.__dict__)
-        return {
-            "matched_papers": summary.matched_papers,
-            "deleted_papers": summary.deleted_papers,
-            "deleted_chunks": summary.deleted_chunks,
-            "papers": [paper.__dict__ for paper in summary.papers],
-            "next_step": "Run build_paper_citation_graph to refresh citation graph exports.",
-        }
+    def get_paper_citations(
+        selector: str,
+        external_sample: int = 20,
+        incoming_limit: int = 50,
+    ) -> dict[str, Any] | None:
+        """Locally-resolved citation view for one paper.
 
-    @mcp.tool()
-    def import_papers(
-        force: bool = False,
-        file_path: str | None = None,
-        only_new: bool = False,
-        retry_failed: bool = False,
-        max_files: int | None = None,
-    ) -> dict[str, int]:
-        """Index PDFs into local Chroma. Use force to rebuild existing files."""
-        summary = run_indexing(
+        Given a selector (title / file name / DOI / source-path substring), returns
+        the paper's outgoing references (each resolved to whether it is in the local
+        library, with local title/path) and the local papers that reference it
+        (incoming), plus cited_by_count. Useful for "what does this build on?" and
+        "what cites it here?" without re-reading chunk text.
+
+        Note: reference completeness depends on the enrichment provider — CrossRef
+        exposes reference DOIs (directly matchable to local DOIs), OpenAlex exposes
+        work ids (matched via local openalex_id).
+        """
+        return paper_citations(
             config,
-            force=force,
-            file_path=file_path,
-            only_new=only_new,
-            retry_failed=retry_failed,
-            max_files=max_files,
+            selector,
+            external_sample=external_sample,
+            incoming_limit=incoming_limit,
         )
-        logger.info("mcp.import_papers", **summary.__dict__)
-        return {
-            "indexed_files": summary.indexed_files,
-            "skipped_files": summary.skipped_files,
-            "chunks": summary.chunks,
-            "duplicate_files": summary.duplicate_files,
-            "enriched_metadata_files": summary.enriched_metadata_files,
-            "failed_metadata_files": summary.failed_metadata_files,
-        }
-
-    @mcp.tool()
-    def enrich_paper_metadata(
-        force: bool = False,
-        file_path: str | None = None,
-        max_files: int | None = None,
-    ) -> dict[str, int]:
-        """Fetch DOI and bibliographic metadata for PDFs."""
-        summary = enrich_metadata(
-            config,
-            force=force,
-            file_path=file_path,
-            max_files=max_files,
-        )
-        logger.info("mcp.enrich_paper_metadata", **summary.__dict__)
-        return {
-            "checked_files": summary.checked_files,
-            "updated_files": summary.updated_files,
-            "skipped_files": summary.skipped_files,
-            "failed_files": summary.failed_files,
-        }
-
-    @mcp.tool()
-    def dedupe_papers(
-        file_path: str | None = None,
-        max_files: int | None = None,
-    ) -> dict[str, int | str]:
-        """Build a duplicate-paper report."""
-        summary = run_dedup_report(config, file_path=file_path, max_files=max_files)
-        logger.info("mcp.dedupe_papers", **summary.__dict__)
-        return {
-            "checked_files": summary.checked_files,
-            "duplicate_pairs": summary.duplicate_pairs,
-            "skipped_files": summary.skipped_files,
-            "report_path": summary.report_path,
-        }
-
-    @mcp.tool()
-    def build_paper_citation_graph() -> dict[str, int | str]:
-        """Build a local citation graph JSON file from enriched metadata."""
-        summary = build_citation_graph(config)
-        logger.info("mcp.build_paper_citation_graph", **summary.__dict__)
-        return {
-            "nodes": summary.nodes,
-            "edges": summary.edges,
-            "path": summary.path,
-            "mermaid_path": summary.mermaid_path,
-        }
 
     @mcp.tool()
     def service_info() -> dict[str, Any]:

@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from traceback import format_exception_only
+from typing import Any
+
+import chromadb
 
 from rag_paper.chunking import chunk_document
 from rag_paper.config import AppConfig
@@ -15,7 +18,7 @@ from rag_paper.logging import logger
 from rag_paper.manifest import IndexManifest, file_sha256
 from rag_paper.metadata import load_paper_metadata, metadata_for_pdf
 from rag_paper.pdf import extract_pdf_text
-from rag_paper.store import ChromaPaperStore
+from rag_paper.store import ChromaPaperStore, normalize_metadata
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,13 @@ class IndexSummary:
     enriched_metadata_files: int = 0
     failed_metadata_files: int = 0
     duplicate_files: int = 0
+
+
+@dataclass(frozen=True)
+class RefreshSummary:
+    papers: int
+    chunks_updated: int
+    skipped_papers: int
 
 
 @dataclass(frozen=True)
@@ -418,6 +428,7 @@ def run_indexing(
                         config,
                         [enrichment_target],
                         metadata_map=metadata_map,
+                        store=store,
                     )
                     enriched_metadata_files += enrichment_summary.updated_files
                     failed_metadata_files += enrichment_summary.failed_files
@@ -447,6 +458,7 @@ def run_indexing(
             config,
             [target for target, _, _ in post_index_enrichment_targets],
             metadata_map=metadata_map,
+            store=store,
         )
         enriched_metadata_files += enrichment_summary.updated_files
         failed_metadata_files += enrichment_summary.failed_files
@@ -462,4 +474,64 @@ def run_indexing(
         enriched_metadata_files=enriched_metadata_files,
         failed_metadata_files=failed_metadata_files,
         duplicate_files=duplicate_files,
+    )
+
+
+def refresh_chunk_metadata(
+    config: AppConfig,
+    *,
+    metadata_map: dict[str, dict[str, Any]] | None = None,
+) -> RefreshSummary:
+    """Update indexed chunks' metadata from paper_metadata.json without re-embedding.
+
+    Run this after ``enrich-metadata`` has corrected titles/DOIs/etc.: for every
+    paper already in Chroma, merge its corrected metadata into the chunks'
+    existing metadata (preserving source_path / chunk_index / chunk_type). No text
+    is re-extracted and no embeddings are recomputed, so it is fast. Chunk text
+    (including abstract-chunk text) is not changed by this.
+    """
+    if metadata_map is None:
+        metadata_map = load_paper_metadata(config.metadata_path)
+
+    client = chromadb.PersistentClient(path=str(config.chroma_dir))
+    collection = client.get_or_create_collection(
+        name=config.chroma.collection, metadata={"hnsw:space": "cosine"}
+    )
+    payload = collection.get(include=["metadatas"])
+
+    groups: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    for chunk_id, metadata in zip(payload.get("ids", []), payload.get("metadatas", [])):
+        if not isinstance(metadata, dict):
+            continue
+        source_path = str(
+            metadata.get("source_path") or metadata.get("file_name") or chunk_id
+        )
+        groups[source_path].append((str(chunk_id), metadata))
+
+    papers = 0
+    chunks_updated = 0
+    skipped_papers = 0
+    for source_path, items in groups.items():
+        corrected = {
+            key: value
+            for key, value in metadata_for_pdf(metadata_map, Path(source_path)).items()
+            if value not in ("", None, [])
+        }
+        if not corrected:
+            skipped_papers += 1
+            continue
+        ids = [chunk_id for chunk_id, _ in items]
+        metadatas = [normalize_metadata({**meta, **corrected}) for _, meta in items]
+        collection.update(ids=ids, metadatas=metadatas)
+        papers += 1
+        chunks_updated += len(ids)
+
+    logger.info(
+        "index.metadata_refresh",
+        papers=papers,
+        chunks_updated=chunks_updated,
+        skipped_papers=skipped_papers,
+    )
+    return RefreshSummary(
+        papers=papers, chunks_updated=chunks_updated, skipped_papers=skipped_papers
     )

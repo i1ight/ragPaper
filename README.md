@@ -120,11 +120,15 @@ For stdio clients, start it with `rag-paper serve --transport stdio`.
 
 Indexing is incremental. rag-paper stores `size + mtime_ns` in the manifest and only computes SHA256 when the quick file signature changes. Failed files are recorded in a JSONL log and can be retried with `rag-paper index --retry-failed`.
 
+`rag-paper index --update-metadata-only` does **not** re-vectorize. It refreshes each indexed chunk's metadata (title, DOI, authors, …) from `paper_metadata.json` in place, so changes from `enrich-metadata` become visible to search without recomputing embeddings. Run it after `enrich-metadata`; chunk text (including abstract-chunk text) is not changed.
+
 ### Search and Retrieval
 
 `rag-paper search` performs local hybrid retrieval over indexed chunks. It combines vector similarity from Chroma with BM25 keyword matching, then returns compact source-aware excerpts that are suitable for sending to an LLM instead of whole PDFs.
 
 Search supports filters such as author, year, tag, and file name. The same retrieval engine powers the MCP tools.
+
+Optionally enable a reranker (`reranker.enabled`) to re-score the top candidates by a continuous P(yes) relevance score read from the model's `yes`/`no` token logprobs (Qwen3-Reranker style, e.g. `dengcao/Qwen3-Reranker-4B` via Ollama); relevant chunks are promoted above spurious lexical/vector matches. It adds latency proportional to the candidate count, so keep `reranker.top_k` modest.
 
 ### Indexed Paper Inspection
 
@@ -152,7 +156,7 @@ Title quality checks reject obvious spam, URLs, ad-like strings, and symbol-heav
 
 ### MCP Server
 
-`rag-paper serve` starts an MCP server so external tools can query the local paper library. MCP clients can import papers, search chunks, list indexed papers, inspect metadata, delete indexed records, enrich metadata, deduplicate papers, fetch specific chunks, export context, and build citation graphs.
+`rag-paper serve` starts an MCP server so external tools can query the local paper library. The server is **query-only**: clients can search chunks, find chunks by metadata, list and inspect indexed papers, fetch chunks by id, and export context. Importing, enriching, deduplicating, deleting, and citation-graph builds are CLI-only — the MCP server never mutates the library.
 
 ## Typical Workflows
 
@@ -274,6 +278,32 @@ rag-paper enrich-metadata --file /path/to/paper.pdf --force
 
 `--file` first checks whether the PDF has already been indexed in local Chroma. If not, rag-paper exits and asks you to index it first.
 
+Re-check DOIs already in metadata and correct mismatches:
+
+```bash
+rag-paper enrich-metadata --reverify
+```
+
+`--reverify` re-checks every paper that already has a DOI. The stored DOI is treated as unverified and re-checked against the paper's title and year (see below); if it no longer matches, it is dropped and a fresh title search tries to replace it. If no confident replacement is found, the untrusted enrichment fields are **cleared** (DOI/title/authors/… removed, file/tags kept) instead of being left wrong — the run reports a `Cleared files` count. Corrections and clears are logged (`metadata.reverify_corrected`, `metadata.cleared_unmatched`). `--force` does the same re-derivation unconditionally for every paper (it re-derives, not just refreshes). Run either after upgrading, or whenever you suspect wrong associations.
+
+### Title verification and association safety
+
+To avoid grafting a citation's metadata onto the wrong paper, every lookup is checked against the document's title:
+
+- DOIs typed into `paper_metadata.json` (`doi` / `url` / `external_url`) are trusted as-is.
+- DOIs mined out of PDF body text are *speculative* — they are kept only if the returned work's title is similar enough to the paper's title.
+- Title-search best matches from CrossRef/OpenAlex, and every cache hit, are checked the same way; a low-similarity match is rejected rather than written.
+- During `--reverify` / `--force`, the reference title is taken from the **filename** (Zotero `Authors - Year - Title.pdf`), falling back to the PDF first page — never from the stored title (that would be circular). The filename year is cross-checked against the matched work's year (≈2-year slack for preprint→published lag), which rejects near-namesakes (e.g. *BERT* vs *Spectrum-BERT*) when the years diverge.
+- If a stored DOI fails these checks and no confident replacement is found, the enrichment fields are cleared (see `--reverify` above) so wrong data does not persist.
+
+Residual limitation: a different paper with a deliberately similar title *and* a close or missing year (a true near-namesake) can still slip through and may need a manual edit.
+
+Relevant thresholds (see Configuration Reference):
+
+- `min_title_similarity` (default `0.6`): title-similarity threshold for accepting a match.
+- `min_title_score` (default `3.0`): minimum CrossRef relevance score.
+- `min_openalex_score` (default `0.5`): minimum OpenAlex relevance score.
+
 Metadata enrichment uses a SQLite cache by default:
 
 ```text
@@ -281,6 +311,8 @@ rag_paper_data/cache/metadata_enrichment.sqlite3
 ```
 
 This avoids repeatedly calling CrossRef/OpenAlex for the same DOI or title query.
+
+When a provider returns an abstract (OpenAlex), it is indexed as its own searchable chunk alongside the paper's body chunks, so abstract-level matches surface in `search_papers` / `rag-paper search`. Abstracts are written during indexing (per-file/after-index enrichment) and via `enrich-metadata`; papers enriched before this feature need a re-index or re-enrich to pick up the abstract chunk.
 
 ## MCP Usage
 
@@ -320,20 +352,18 @@ stdio configuration example:
 }
 ```
 
-Available MCP tools include:
+Available MCP tools (all read-only):
 
-- `service_info`
-- `import_papers`
-- `list_indexed_papers`
-- `show_indexed_paper`
-- `delete_indexed_paper`
-- `search_papers`
-- `search_by_metadata`
-- `get_chunk`
-- `export_context`
-- `enrich_paper_metadata`
-- `dedupe_papers`
-- `build_paper_citation_graph`
+- `search_papers` — hybrid BM25 + vector search over chunks; supports `group_by_paper` (best chunk per paper) and `max_text_chars` (compact snippets)
+- `search_by_metadata` — find chunks by author/year/tag/file name; supports `group_by_paper` and `max_text_chars` like `search_papers`
+- `get_chunk` — fetch one chunk by id
+- `export_context` — export selected chunks as a Markdown context block
+- `list_indexed_papers` — list indexed papers
+- `show_indexed_paper` — inspect a paper's metadata and chunk ids
+- `get_paper_citations` — locally-resolved references (outgoing + incoming) for one paper
+- `service_info` — service configuration
+
+The server exposes no write tools. Use the CLI (`rag-paper index`, `enrich-metadata`, `dedupe-papers`, `delete-indexed-paper`, `build-citation-graph`) for anything that mutates the library.
 
 ## CLI Commands
 
@@ -416,6 +446,16 @@ Common options:
 - `metadata_enrichment.https_proxy`: HTTPS proxy.
 - `metadata_enrichment.socks5_proxy`: SOCKS5 proxy.
 - `metadata_enrichment.cache_path`: SQLite enrichment cache path.
+- `metadata_enrichment.min_title_score`: minimum CrossRef relevance score for a title match. Default: `3.0`.
+- `metadata_enrichment.min_openalex_score`: minimum OpenAlex relevance score for a title match. Default: `0.5`.
+- `metadata_enrichment.min_title_similarity`: minimum title similarity (0–1) for accepting a DOI/title match and preventing wrong associations. Default: `0.6`.
+- `reranker.enabled`: enable cross-encoder reranking of search results. Default: `false`.
+- `reranker.model`: reranker model (Ollama), e.g. `dengcao/Qwen3-Reranker-4B:Q5_K_M`.
+- `reranker.top_k`: number of first-stage candidates to rerank per query. Default: `20`.
+- `reranker.concurrency`: parallel reranker requests. Default: `4` (raise Ollama's `OLLAMA_NUM_PARALLEL` to match).
+- `reranker.top_logprobs`: number of top candidate tokens sampled for the P(yes) score. Default: `10`.
+- `retrieval.fusion`: how vector and BM25 results are fused — `rrf` (default; reciprocal rank fusion, robust to score distributions) or `linear` (weighted score, uses `vector_weight`/`bm25_weight`).
+- `retrieval.rrf_k`: RRF smoothing constant. Default: `60`.
 - `dedup.enabled`: enable duplicate report before indexing.
 - `dedup.action`: `report` or `skip`.
 - `dedup.similarity_threshold`: semantic duplicate threshold.

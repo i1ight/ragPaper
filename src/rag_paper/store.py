@@ -72,6 +72,9 @@ class ChromaPaperStore:
     def delete_source(self, source_path: str) -> None:
         self.collection.delete(where={"source_path": source_path})
 
+    def count(self) -> int:
+        return self.collection.count()
+
     def get_chunk(self, chunk_id: str) -> dict[str, Any] | None:
         result = self.collection.get(ids=[chunk_id], include=["documents", "metadatas"])
         if not result["ids"]:

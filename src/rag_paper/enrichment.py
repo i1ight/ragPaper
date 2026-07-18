@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from dataclasses import asdict
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
 
 from rag_paper.config import AppConfig, MetadataEnrichmentConfig, MetadataProviderName
 from rag_paper.enrichment_cache import MetadataEnrichmentCache
-from rag_paper.indexer import discover_configured_pdfs
 from rag_paper.logging import logger
 from rag_paper.metadata import (
     load_paper_metadata,
@@ -20,8 +21,16 @@ from rag_paper.metadata import (
     metadata_key_for_pdf,
     save_paper_metadata,
 )
-from rag_paper.pdf import extract_pdf_text
-from rag_paper.title_quality import best_title, is_trusted_title
+from rag_paper.models import PaperChunk
+from rag_paper.title_quality import (
+    best_title,
+    is_trusted_title,
+    parse_filename_title_and_year,
+    pick_title_line,
+)
+
+if TYPE_CHECKING:
+    from rag_paper.store import ChromaPaperStore
 
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 TRAILING_DOI_CHARS = ".,;:)]}>\"'"
@@ -33,6 +42,7 @@ class EnrichmentSummary:
     updated_files: int
     skipped_files: int
     failed_files: int
+    cleared_files: int = 0
 
 
 @dataclass(frozen=True)
@@ -191,7 +201,12 @@ class OpenAlexClient:
             },
         )
         response.raise_for_status()
-        return self._first_work(response.json())
+        work = self._first_work(response.json())
+        if work is None:
+            return None
+        if work.score is not None and work.score < self.config.min_openalex_score:
+            return None
+        return work
 
     def _first_work(self, payload: dict[str, Any]) -> MetadataWork | None:
         results = payload.get("results")
@@ -231,12 +246,24 @@ def enrich_metadata(
     if max_files is not None:
         targets = targets[:max_files]
 
-    summary = enrich_targets(
-        config,
-        targets,
-        metadata_map=metadata_map,
-        force=force,
+    # Build a store so enrichment can index each paper's abstract as a searchable
+    # chunk. Imported lazily to keep this module decoupled from the indexing stack.
+    from rag_paper.embeddings import build_embedding_provider
+    from rag_paper.store import ChromaPaperStore
+
+    store = ChromaPaperStore(
+        config.chroma_dir, config.chroma.collection, build_embedding_provider(config)
     )
+    try:
+        summary = enrich_targets(
+            config,
+            targets,
+            metadata_map=metadata_map,
+            force=force,
+            store=store,
+        )
+    finally:
+        store.client.close()
     save_paper_metadata(config.metadata_path, metadata_map)
     return summary
 
@@ -247,6 +274,8 @@ def enrich_targets(
     *,
     metadata_map: dict[str, dict[str, Any]] | None = None,
     force: bool = False,
+    reverify: bool = False,
+    store: ChromaPaperStore | None = None,
 ) -> EnrichmentSummary:
     if not config.metadata_enrichment.enabled:
         return EnrichmentSummary(checked_files=0, updated_files=0, skipped_files=0, failed_files=0)
@@ -259,13 +288,18 @@ def enrich_targets(
     updated_files = 0
     skipped_files = 0
     failed_files = 0
+    cleared_files = 0
 
     try:
         try:
             for target in targets:
                 checked_files += 1
                 existing = metadata_for_pdf(metadata_map, target.path)
-                if existing.get("doi") and not force:
+                # In normal runs a file that already has a DOI is left alone. In
+                # reverify mode we re-check it: a DOI that fails the title gate is
+                # dropped and replaced by a fresh title search, repairing bad
+                # associations written before verification existed.
+                if existing.get("doi") and not force and not reverify:
                     skipped_files += 1
                     logger.info("metadata.skip_existing_doi", file=str(target.path), doi=existing["doi"])
                     continue
@@ -280,19 +314,46 @@ def enrich_targets(
                     target,
                     merged,
                     force=force,
+                    reverify=reverify,
                 )
 
                 if work is None:
                     if provider_failed:
                         failed_files += 1
                         logger.warning("metadata.all_providers_failed", file=str(target.path))
+                    elif (force or reverify) and existing.get("doi"):
+                        # The stored DOI was rejected and no replacement was found.
+                        # Rather than keep the now-untrusted enrichment data, clear
+                        # it so the wrong DOI/title/authors stop polluting search &
+                        # citations. (Skipped on provider failure: that may be
+                        # transient, so existing data is left intact.)
+                        key = metadata_key_for_pdf(metadata_map, target.path)
+                        previous_doi = existing["doi"]
+                        metadata_map[key] = _clear_enrichment_fields(existing)
+                        save_paper_metadata(config.metadata_path, metadata_map)
+                        cleared_files += 1
+                        logger.warning(
+                            "metadata.cleared_unmatched",
+                            file=str(target.path),
+                            previous_doi=previous_doi,
+                        )
                     else:
                         skipped_files += 1
                         logger.info("metadata.no_provider_match", file=str(target.path))
                     continue
 
                 key = metadata_key_for_pdf(metadata_map, target.path)
-                metadata_map[key] = _merge_work_metadata(merged, work, force=force)
+                metadata_map[key] = _merge_work_metadata(merged, work, force=force or reverify)
+                if reverify and existing.get("doi") and _normalize_doi(existing["doi"]) != work.doi:
+                    logger.warning(
+                        "metadata.reverify_corrected",
+                        file=str(target.path),
+                        previous_doi=existing["doi"],
+                        doi=work.doi,
+                        title=work.title,
+                        source=work.source,
+                    )
+                _maybe_index_abstract(store, metadata_map[key], target.path)
                 save_paper_metadata(config.metadata_path, metadata_map)
                 updated_files += 1
                 logger.info(
@@ -315,6 +376,7 @@ def enrich_targets(
         updated_files=updated_files,
         skipped_files=skipped_files,
         failed_files=failed_files,
+        cleared_files=cleared_files,
     )
 
 
@@ -334,14 +396,9 @@ def infer_title(metadata: dict[str, Any], text: str) -> str:
     if is_trusted_title(title):
         return title.strip()
 
-    lines = [
-        line.strip()
-        for line in text.splitlines()[:80]
-        if 8 <= len(line.strip()) <= 220 and not line.strip().startswith("[Page ")
-    ]
-    if not lines:
-        return best_title(file_name=str(metadata.get("file_name") or ""))
-    return best_title(max(lines[:8], key=len), file_name=str(metadata.get("file_name") or ""))
+    return pick_title_line(
+        text.splitlines(), file_name=str(metadata.get("file_name") or "")
+    )
 
 
 def discover_enrichment_targets(
@@ -350,6 +407,12 @@ def discover_enrichment_targets(
     *,
     file_path: str | None,
 ) -> list[EnrichmentTarget]:
+    # Imported lazily so that metadata enrichment does not drag the full indexing
+    # stack (chromadb / llama-index / pymupdf) into every caller. Mirrors the
+    # lazy import of this module from indexer.py.
+    from rag_paper.indexer import discover_configured_pdfs
+    from rag_paper.pdf import extract_pdf_text
+
     if file_path:
         pdf_path = Path(file_path).expanduser().resolve()
         if not pdf_path.exists():
@@ -398,6 +461,7 @@ def _lookup_work_with_fallback(
     metadata: dict[str, Any],
     *,
     force: bool,
+    reverify: bool = False,
 ) -> tuple[MetadataWork | None, bool]:
     provider_failed = False
     for provider in _provider_order(config):
@@ -405,7 +469,9 @@ def _lookup_work_with_fallback(
         if client is None:
             continue
         try:
-            work = _lookup_work(client, provider, cache, target, metadata, force=force)
+            work = _lookup_work(
+                client, provider, cache, target, metadata, force=force, reverify=reverify
+            )
         except httpx.HTTPError as exc:
             provider_failed = True
             logger.warning(
@@ -429,27 +495,95 @@ def _lookup_work(
     metadata: dict[str, Any],
     *,
     force: bool,
+    reverify: bool = False,
 ) -> MetadataWork | None:
-    possible_doi = _first_doi(metadata, target.text)
-    if possible_doi:
-        cached = None if force else _cache_get_work(cache, provider, "doi", possible_doi)
-        if cached is not None:
-            return cached
-        work = client.lookup_by_doi(possible_doi)
-        if work is not None:
-            cache.set(provider, "doi", possible_doi, asdict(work))
-            return work
+    config = client.config
+    min_similarity = config.min_title_similarity
 
-    title = infer_title(metadata, target.text)
-    if title:
-        title_key = _normalize_cache_text(title)
+    if force or reverify:
+        # We are re-checking data that may already be wrong. The filename
+        # ("Authors - Year - Title.pdf" for Zotero libraries) is the most reliable
+        # reference — body-text inference can pick boilerplate like "Published as
+        # a conference paper at ICLR ...". Prefer the filename title/year and fall
+        # back to the text-derived title only when the filename doesn't parse.
+        file_name = str(metadata.get("file_name") or target.path.name)
+        filename_title, filename_year = parse_filename_title_and_year(file_name)
+        reference_title = filename_title or pick_title_line(
+            target.text.splitlines(), file_name=file_name
+        )
+        expected_year = filename_year
+    else:
+        reference_title = infer_title(metadata, target.text)
+        expected_year = None
+
+    # A DOI mined out of the PDF body is often a *citation*, not this paper's own
+    # DOI. Treat user-supplied DOIs (metadata.doi/url/external_url) as trusted;
+    # treat anything pulled from full text as speculative and require it to pass
+    # the title-similarity gate. In force/reverify mode the already-stored DOI is
+    # also treated as speculative so it actually gets re-derived and re-checked.
+    trusted_doi, speculative_doi = _first_doi(
+        metadata, target.text, trust_existing=not (force or reverify)
+    )
+    doi_candidates: list[tuple[str, bool]] = []
+    if trusted_doi:
+        doi_candidates.append((trusted_doi, True))
+    elif speculative_doi:
+        doi_candidates.append((speculative_doi, False))
+
+    for possible_doi, is_trusted in doi_candidates:
+        cached = None if force else _cache_get_work(cache, provider, "doi", possible_doi)
+        work = cached if cached is not None else client.lookup_by_doi(possible_doi)
+        if work is None:
+            continue
+        if _accept_work(
+            work,
+            reference_title,
+            is_trusted=is_trusted,
+            min_similarity=min_similarity,
+            expected_year=expected_year,
+        ):
+            if cached is None:
+                cache.set(provider, "doi", possible_doi, asdict(work))
+            return work
+        title_matched = _work_matches_title(work, reference_title, min_similarity)
+        logger.warning(
+            "metadata.doi_year_mismatch" if title_matched else "metadata.doi_title_mismatch",
+            provider=provider,
+            file=str(target.path),
+            doi=possible_doi,
+            trusted=is_trusted,
+            returned_title=work.title,
+            returned_year=work.year,
+            reference_title=reference_title,
+            expected_year=expected_year,
+        )
+
+    if reference_title:
+        title_key = _normalize_cache_text(reference_title)
         cached = None if force else _cache_get_work(cache, provider, "title", title_key)
-        if cached is not None:
-            return cached
-        work = client.query_by_title(title)
-        if work is not None:
-            cache.set(provider, "title", title_key, asdict(work))
-        return work
+        work = cached if cached is not None else client.query_by_title(reference_title)
+        if work is None:
+            return None
+        if _accept_work(
+            work,
+            reference_title,
+            is_trusted=False,
+            min_similarity=min_similarity,
+            expected_year=expected_year,
+        ):
+            if cached is None:
+                cache.set(provider, "title", title_key, asdict(work))
+            return work
+        title_matched = _work_matches_title(work, reference_title, min_similarity)
+        logger.info(
+            "metadata.year_mismatch" if title_matched else "metadata.title_similarity_below_threshold",
+            provider=provider,
+            file=str(target.path),
+            similarity=round(_title_similarity(reference_title, work.title), 3),
+            threshold=min_similarity,
+            returned_year=work.year,
+            expected_year=expected_year,
+        )
     return None
 
 
@@ -469,20 +603,199 @@ def _normalize_cache_text(value: str) -> str:
     return " ".join(value.lower().strip().split())
 
 
-def _first_doi(metadata: dict[str, Any], text: str) -> str | None:
+def _abstract_chunk_id(source_path: str) -> str:
+    # Content-independent: a paper has at most one abstract slot, so re-enrichment
+    # upserts the same record instead of orphaning the previous one when the
+    # abstract text changes.
+    return hashlib.sha256(f"{source_path}:abstract".encode("utf-8")).hexdigest()[:24]
+
+
+def _build_abstract_chunk(
+    metadata: dict[str, Any], pdf_path: Path
+) -> PaperChunk | None:
+    abstract = str(metadata.get("abstract") or "").strip()
+    if not abstract:
+        return None
+    source_path = str(pdf_path.resolve())
+    title = str(metadata.get("title") or metadata.get("file_name") or "").strip()
+    text = f"{title}\n\n{abstract}".strip() if title else abstract
+    chunk_metadata = dict(metadata)
+    chunk_metadata["source_path"] = source_path
+    chunk_metadata["chunk_type"] = "abstract"
+    return PaperChunk(id=_abstract_chunk_id(source_path), text=text, metadata=chunk_metadata)
+
+
+def _maybe_index_abstract(
+    store: ChromaPaperStore | None, metadata: dict[str, Any], pdf_path: Path
+) -> None:
+    """Index a paper's abstract as its own searchable chunk when a store is wired.
+
+    Best-effort: a failure to embed/upsert the abstract must not break enrichment.
+    """
+    if store is None:
+        return
+    chunk = _build_abstract_chunk(metadata, pdf_path)
+    if chunk is None:
+        return
+    try:
+        store.upsert_chunks([chunk])
+    except Exception as exc:  # noqa: BLE001 - abstract indexing is optional
+        logger.warning("metadata.abstract_chunk_failed", file=str(pdf_path), error=str(exc))
+
+
+def _normalize_title_for_compare(value: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", (value or "").lower()).split())
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """Return a 0..1 similarity score between two titles.
+
+    Takes the better of a character-sequence ratio and a token Jaccard overlap,
+    so it tolerates rewording, subtitle stripping, and CJK titles (``\\w`` is
+    Unicode-aware for ``str``).
+    """
+    normalized_a = _normalize_title_for_compare(a)
+    normalized_b = _normalize_title_for_compare(b)
+    if not normalized_a or not normalized_b:
+        return 0.0
+    ratio = SequenceMatcher(None, normalized_a, normalized_b).ratio()
+    tokens_a = set(normalized_a.split())
+    tokens_b = set(normalized_b.split())
+    if tokens_a and tokens_b:
+        jaccard = len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+        ratio = max(ratio, jaccard)
+    return ratio
+
+
+# When re-checking with a filename-derived year, allow this many years of slack
+# (preprint vs published, etc.) before treating a year mismatch as a wrong paper.
+_YEAR_TOLERANCE = 2
+
+
+def _work_matches_title(
+    work: MetadataWork, inferred_title: str, min_similarity: float
+) -> bool:
+    if not inferred_title or not work.title:
+        return False
+    return _title_similarity(inferred_title, work.title) >= min_similarity
+
+
+def _year_matches(work: MetadataWork, expected_year: int | None) -> bool:
+    """Cross-check the work's year against the filename-derived year.
+
+    Used to reject near-namesakes (e.g. BERT vs "Spectrum-BERT") whose titles are
+    intentionally similar but which were published years apart. Missing year on
+    either side means we cannot judge, so we do not reject on year alone.
+    """
+    if expected_year is None or work.year is None:
+        return True
+    return abs(work.year - expected_year) <= _YEAR_TOLERANCE
+
+
+def _accept_work(
+    work: MetadataWork,
+    inferred_title: str,
+    *,
+    is_trusted: bool,
+    min_similarity: float,
+    expected_year: int | None = None,
+) -> bool:
+    """Gate a looked-up work against the document's inferred title (and year).
+
+    User-supplied (trusted) DOIs are accepted as-is — the user vouched for them.
+    Everything else — speculative DOIs mined from text, title-query best matches,
+    and cache hits — must clear the title-similarity threshold (and, when a
+    filename year is available, not diverge from it by more than the tolerance).
+    """
+    if is_trusted:
+        return True
+    if not _work_matches_title(work, inferred_title, min_similarity):
+        return False
+    return _year_matches(work, expected_year)
+
+
+def _first_doi(
+    metadata: dict[str, Any],
+    text: str,
+    *,
+    trust_existing: bool = True,
+) -> tuple[str | None, str | None]:
+    """Return ``(trusted_doi, speculative_doi)`` for a document.
+
+    A DOI is *trusted* when the user supplied it explicitly via ``metadata.doi``
+    or a ``url``/``external_url`` field. A DOI is *speculative* when it is mined
+    out of the PDF full text (where it is frequently a citation), or — in
+    ``reverify`` mode (``trust_existing=False``) — when it is an already-stored
+    DOI being re-checked against the title rather than taken on faith.
+
+    Speculative DOIs are only produced when no trusted DOI is available, and
+    callers must verify them against the inferred title before use.
+    """
+    existing: str | None = None
+
     doi = metadata.get("doi")
     if isinstance(doi, str) and doi.strip():
-        return _normalize_doi(doi)
+        existing = _normalize_doi(doi)
 
-    for key in ("url", "external_url"):
-        value = metadata.get(key)
-        if isinstance(value, str):
-            extracted = extract_doi(value)
-            if extracted:
-                return _normalize_doi(extracted)
+    if not existing:
+        for key in ("url", "external_url"):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                extracted = extract_doi(value)
+                if extracted:
+                    existing = _normalize_doi(extracted)
+                    break
 
-    extracted = extract_doi(text[:8000])
-    return _normalize_doi(extracted) if extracted else None
+    trusted: str | None = None
+    speculative: str | None = None
+
+    if existing:
+        if trust_existing:
+            trusted = existing
+        else:
+            # reverify mode: re-check an already-stored DOI against the title
+            # instead of trusting it blindly.
+            speculative = existing
+    elif trust_existing:
+        # Only mine the body when there is no stored/url DOI at all, and never in
+        # reverify mode — a stored DOI that fails verification should fall back to
+        # a title search, not to an even-riskier text-mined DOI.
+        extracted = extract_doi(text[:4000])
+        if extracted:
+            speculative = _normalize_doi(extracted)
+
+    return trusted, speculative
+
+
+# Fields written by `_merge_work_metadata` (the enrichment output). On
+# clear-on-reject these are dropped; user/file fields (file_name, source_path,
+# tags, venue, ...) are preserved.
+_ENRICHMENT_FIELDS = (
+    "doi",
+    "title",
+    "authors",
+    "year",
+    "container_title",
+    "publisher",
+    "url",
+    "openalex_id",
+    "abstract",
+    "referenced_dois",
+    "referenced_work_ids",
+    "related_work_ids",
+    "cited_by_count",
+    "metadata_source",
+    "metadata_enriched_at",
+)
+
+
+def _clear_enrichment_fields(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Strip enrichment-output fields, keeping user/file-derived fields."""
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in _ENRICHMENT_FIELDS and value not in ("", None, [])
+    }
 
 
 def _merge_work_metadata(
